@@ -204,7 +204,7 @@ The example displays the current SVO RBG image, depth image and pointcloud as we
 
 - Replaying specific recorded sequences with different SDK parameters to optimize modules (depth, positional tracking, object detection) **synchronized with external recorded data** (e.g other sensors, other robotics module messages,  proprietary ros messages...)
 - Test new AI models on the recorded sequence to check for improvements
-- Inspect carefully a scene to detect potential issues.
+- Inspect carefully a scene to detect potential issues, by pausing on the data replay and manually seeking forward on the data.
 - Topics can be reused as input of other nodes to check their behavior.
 
 #### How to use it ? 
@@ -252,7 +252,26 @@ ros2 launch ros2_replay_data sync_node_demo.launch.py namespace:='sync_node' cam
 
 Parameters :
 - `sync_queue_size`: The number of messages to store for each input topic. Helps the synchronizer match messages by keeping recent history. Larger queue_size = more chance to find a match, but uses more memory.
-- `slop`: The maximum time difference (in seconds) allowed between messages to be considered "synchronized." Use larger slop when sensors are not hardware-synchronized or when network delays are involved (0.2/0.3 are quite common).
+- `slop`: The maximum time difference (in seconds) allowed between messages to be considered "synchronized." Use larger slop when sensors are not hardware-synchronized or when network delays are involved (0.05/0.1 are quite common).
+- `seek_time_step`: the time step increment to seek forward on the data manually when the robot is paused (in seconds).
+
+
+#### Configuration recommendations
+
+`slop` 
+- if set too small (e.g., < 0.05s):
+If you're syncing many topics (e.g., >5) or dealing with different framerates, a tight slop can cause missed synchronization because it's too strict about timing.
+- if set too large (e.g., > 0.2–0.3s):
+May cause too many candidate matches in the internal buffer. Can overload or confuse the synchronizer, especially with many topics or high-frequency streams.
+
+`queue_size`
+- if set too small (e.g., < 100):
+If there's desynchronization (e.g., due to dropped frames from SVO), you risk dropping messages before a match is found.
+- if set too large (e.g., > 500):
+Can lead to backlog, especially when syncing topics with very different rates (e.g., 10 Hz vs 100 Hz) and adding more topics to synchronize with.
+The faster topic's messages will accumulate, while only a few can be matched each cycle (i.e with one message publishing at 10 Hz and one at 100 Hz, Message filter only synchronizes up to 10 messages together per second, leaving the unmatched messages building up the queue). Only the matched messages for synchronization are removed from the queue. Unmatched messages are removed from the queue when it is full. 
+A huge queue increases memory use as unmatched messages accumulates without being removed, which results in longer delays in matching, hurting real-time performance and potentially causing synchronization loss.
+
 
 #### Launcher workflow 
 
@@ -261,7 +280,9 @@ The launchers starts replaying the SVO with the ZED ROS Wrapper using the specif
 Keyboard keys to control the svo replay : 
 
 - "Space" key : Pause/Resume the SVO.
-- "Right Arrow" key : Move to the next frame (only when SVO is paused).
+- "Right Arrow" key : Manually seek forward on the data by one time step increment (only when SVO is paused).
+- "Up Arrow" key: Increase the `seek_time_step` parameter by 0.1 seconds.
+- "Down Arrow" key: Decrease the `seek_time_step` parameter by 0.1 seconds.
 
 >Adapt the Rviz panel to match the relevant topics you want to see displayed. If the namespace has been changed, topic names will need to be changed too. 
 > To connect data from external sensors publishing in other frames, you might need to set up a static transform between the camera frame and the sensor frame to see it synchronized in rviz. 
