@@ -170,6 +170,8 @@ class DataSynchronizer(Node):
         self.get_logger().info(" Keyboard controls:")
         self.get_logger().info("   [Space] Pause/Resume")
         self.get_logger().info("   [→]     Next Rosbag message (when paused)")
+        self.get_logger().info("   [↑]     Increase seek time step increment")
+        self.get_logger().info("   [↓]     Decrease seek time step increment")
         self.get_logger().info("=====================================================")
 
         ############################################################################################
