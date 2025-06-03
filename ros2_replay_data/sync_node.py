@@ -45,8 +45,9 @@ class DataSynchronizer(Node):
             self.namespace = self.camera_name+'/zed_node'
         else:
             self.namespace = self.namespace+'/'+self.camera_name
-        self.sync_queue_size = self.declare_parameter("sync_queue_size", 2000).get_parameter_value().integer_value
-        self.sync_slop = self.declare_parameter("sync_slop", 0.3).get_parameter_value().double_value
+        self.sync_queue_size = self.declare_parameter("sync_queue_size", 500).get_parameter_value().integer_value
+        self.sync_slop = self.declare_parameter("sync_slop", 0.05).get_parameter_value().double_value
+        self.seek_time_step = self.declare_parameter("seek_time_step", 0.5).get_parameter_value().double_value
 
         if not self.bag_path or not self.yaml_file:
             self.get_logger().error("Missing parameters: bag_path or yaml_file")
@@ -56,6 +57,7 @@ class DataSynchronizer(Node):
 
         # Initialize publishers and subscribers
         self.sync_subscribers = []
+        self.wrapper_subscribers = []
         self.rosbag_topic_publishers = {}
         self.sync_topic_publishers = {}
 
@@ -106,6 +108,7 @@ class DataSynchronizer(Node):
         self.reader.open(storage_options, converter_options)
         self.rosbag_current_timestamp = 0.0 
         self.rosbag_started = False
+        self.rosbag_has_catched_up = False
 
         # Load topics from ROS Bag to synchronize (list of topics present in the yaml config file)
         self.load_rosbag_topics(self.yaml_file)
@@ -163,6 +166,7 @@ class DataSynchronizer(Node):
         self.get_logger().info(f"Opening synchronized topic yaml file: {self.yaml_file}")
         self.get_logger().info(f"Sync queue size: {self.sync_queue_size}")
         self.get_logger().info(f"Sync slop: {self.sync_slop}")
+        self.get_logger().info(f"Seek time step increment: {self.seek_time_step}")
         self.get_logger().info(" Keyboard controls:")
         self.get_logger().info("   [Space] Pause/Resume")
         self.get_logger().info("   [→]     Next Rosbag message (when paused)")
@@ -319,49 +323,117 @@ class DataSynchronizer(Node):
                      self.reset_time = True
                      self.rosbag_paused = False
                      self.svo_paused = False
+                     self.rosbag_has_catched_up = False
                 elif state == "Paused":
                      self.rosbag_paused = True
                      self.svo_paused = True
             elif key == keyboard.Key.right:
-                ## When the SVO is paused, it is possibl to advance frame by frame when the right arrow key button is pressed.
-                self.advance()
+                ## When the SVO is paused, it is possible to seek by a time step increment when the right arrow key button is pressed.
+                if not self.rosbag_has_catched_up:
+                    self.seek_rosbag()
+                else: 
+                    self.seek_if_catchup()
+            elif key == keyboard.Key.up:
+                self.seek_time_step = self.seek_time_step + 0.1
+                self.get_logger().info(f"Seek time increment has increased to: {self.seek_time_step}")
+            elif key == keyboard.Key.down:
+                self.seek_time_step = self.seek_time_step - 0.1
+                if self.seek_time_step < 0.1:
+                    self.seek_time_step = 0.1
+                self.get_logger().info(f"Seek time increment has increased to: {self.seek_time_step}")
                 
-
         with keyboard.Listener(on_press=on_press) as listener:
             listener.join()
 
-    def advance(self): 
-        """In pause mode, advance on the rosbag message by message. As the bag timestamp increases, ensure the SVO timestamp remains synchronized by advancing on the SVO position"""
+    def seek_rosbag(self): 
+        """In pause mode, while the svo is still ahead of the rosbag (i.e: the message filter queue contains svos messages ahead of the rosbag), seek on the rosbag by one increment of the seek_time_step parameter until it catches back the svo. Regular synchronization is still possible"""
+        if not self.rosbag_paused or not self.svo_paused:
+           self.get_logger().info("Rosbag / SVO need to be paused in order for the seek frame feature to work.")
+           return
+        
+        if self.svo_current_timestamp < self.rosbag_current_timestamp:
+            ''' the rosbag has catched up with the svo. Seek can now be a simple publisher of data frame by frame.'''
+            self.get_logger().info(f"ROSBAG has catched up with the SVO")
+            self.rosbag_has_catched_up = True
+            return
+
+        target_time = self.rosbag_current_timestamp + self.seek_time_step
+        self.get_logger().info(f"ROSBAG current timestamp : {self.rosbag_current_timestamp}")
+        self.get_logger().info(f"target timestamp : {target_time}")
+
+        while self.rosbag_current_timestamp < target_time:
+            
+            if self.svo_current_timestamp < self.rosbag_current_timestamp:
+                ''' the rosbag has catched up with the svo. Advance can now be a simple publisher of data frame by frame.'''
+                self.get_logger().info(f"ROSBAG has catched up with the SVO")
+                self.rosbag_has_catched_up = True
+                return
+
+            if self.reader.has_next():
+                topic, data, t = self.reader.read_next()
+                if topic in self.topic_types:
+                    try:
+                        msg_type = self.topic_types[topic]
+                        msg_class = get_message(msg_type)
+                        msg = deserialize_message(data, msg_class)
+                        self.rosbag_current_timestamp = t * 1e-9
+
+                        if topic in self.rosbag_topic_publishers:
+                            self.rosbag_topic_publishers[topic].publish(msg)
+                            
+                    except Exception as e:
+                        self.get_logger().error(f'Error deserializing message for {topic}: {str(e)}')
+            else:
+                self.get_logger().info("Rosbag replay complete")
+
+        self.get_logger().debug(f"ROSBAG current timestamp : {self.rosbag_current_timestamp}")
+        self.get_logger().debug(f"SVO current timestamp : {self.svo_current_timestamp}")
+
+    
+    def seek_if_catchup(self): 
+        """In pause mode, seek on the rosbag by one increment of the advance_time_step parameter. As the rosbag is now catched up with SVO, advance on the SVO frame by frame to keep both timestamps synchronized. Because the wrapper only sends one message when moving to the next the frame, sync with message filter can be lost. 
+        To fix the issue, data is then direclty published in the appropriate topics without message filter.
+        """
         if not self.rosbag_paused or not self.svo_paused:
            self.get_logger().info("Rosbag / SVO need to be paused in order for the advance frame feature to work.")
            return
-        
-        if self.reader.has_next():
-            topic, data, t = self.reader.read_next()
-            if topic in self.topic_types:
+
+        target_time = self.rosbag_current_timestamp + self.seek_time_step
+        self.get_logger().info(f"ROSBAG current timestamp : {self.rosbag_current_timestamp}")
+        self.get_logger().info(f"target timestamp : {target_time}")
+
+        while self.rosbag_current_timestamp < target_time:
+            if self.reader.has_next():
+                topic, data, t = self.reader.read_next()
+                if topic in self.topic_types:
+                    try:
+                        msg_type = self.topic_types[topic]
+                        msg_class = get_message(msg_type)
+                        msg = deserialize_message(data, msg_class)
+                        self.rosbag_current_timestamp = t * 1e-9
+
+                        if topic in self.rosbag_topic_publishers:
+                            self.sync_topic_publishers[topic].publish(msg)
+                            #self.get_logger().info(f'publishing rosbag message')
+                            
+                    except Exception as e:
+                        self.get_logger().error(f'Error deserializing message for {topic}: {str(e)}')
+            else:
+                self.get_logger().info("Rosbag replay complete")
+
+            while self.svo_current_timestamp < self.rosbag_current_timestamp:
                 try:
-                    msg_type = self.topic_types[topic]
-                    msg_class = get_message(msg_type)
-                    msg = deserialize_message(data, msg_class)
-                    self.rosbag_current_timestamp = t * 1e-9
-
-                    if topic in self.rosbag_topic_publishers:
-                        self.rosbag_topic_publishers[topic].publish(msg)
-                        self.get_logger().info("publishing next rosbag message")
+                    self.frame_request.frame_id = self.svo_current_frame +1
+                    self.frame_service_call = self.set_svo_frame_position_client.call_async(self.frame_request)
+                    self.get_logger().debug(f"SVO frame position service call")
+                    self.svo_current_frame = self.svo_current_frame+1
                 except Exception as e:
-                    self.get_logger().error(f'Error deserializing message for {topic}: {str(e)}')
+                    self.get_logger().error(f'Service call failed: {e}')
+                sleep(0.5)
+        self.get_logger().debug(f"ROSBAG current timestamp : {self.rosbag_current_timestamp}")
+        self.get_logger().debug(f"SVO current timestamp : {self.svo_current_timestamp}")
             
-        if self.svo_current_timestamp < self.rosbag_current_timestamp: 
-            #svo is late so advance svo
-            try:
-                self.frame_request.frame_id = self.svo_current_frame +1
-                self.frame_service_call = self.set_svo_frame_position_client.call_async(self.frame_request)
-                self.get_logger().debug(f"SVO frame position service call")
-                self.svo_current_frame = self.svo_current_frame+1
-            except Exception as e:
-                self.get_logger().error(f'Service call failed: {e}')
-
-
+            
     def synchronized_callback(self, *msgs):
         """Publish synchronized messages"""
         if not msgs:
@@ -372,6 +444,10 @@ class DataSynchronizer(Node):
         for topic, msg in zip(self.sync_topic_publishers.keys(), msgs):
             self.sync_topic_publishers[topic].publish(msg)
 
+    def svo_topics_callback(self, msg, topic_name):
+        if self.rosbag_has_catched_up:
+            self.sync_topic_publishers[topic_name].publish(msg)
+            
 
     def load_wrapper_topics(self, yaml_file):
         """ Load topics from YAML file """
@@ -394,6 +470,12 @@ class DataSynchronizer(Node):
                 msg_type = get_message(topic["type"])
                 subscriber = message_filters.Subscriber(self, msg_type, topic["name"])
                 self.sync_subscribers.append(subscriber)
+
+                ##Add to another list of subscribers
+                # Create the subscriber
+                subscriber_wrapper = self.create_subscription(msg_type, topic["name"], lambda msg, t=topic["name"]: self.svo_topics_callback(msg, t),10)
+                self.wrapper_subscribers.append(subscriber_wrapper)
+
                 if self.prefix == "":
                     topic_name = '/sync'+topic["name"]
                 else:

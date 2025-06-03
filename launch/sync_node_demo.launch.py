@@ -59,6 +59,7 @@ def launch_setup(context, *args, **kwargs):
     yaml_path = LaunchConfiguration('yaml_config_path')
     sync_queue_size = LaunchConfiguration('sync_queue_size')
     sync_slop = LaunchConfiguration('sync_slop')
+    seek_time_step = LaunchConfiguration('seek_time_step')
     prefix = LaunchConfiguration('prefix')
 
     namespace_val = namespace.perform(context)
@@ -129,6 +130,7 @@ def launch_setup(context, *args, **kwargs):
                 {'camera_name': camera_name_val},
                 {'sync_queue_size': sync_queue_size},
                 {'sync_slop': sync_slop},
+                {'seek_time_step': seek_time_step},
                 {'prefix': prefix_val}
             ],
         )
@@ -191,12 +193,16 @@ def generate_launch_description():
                 description='String prefix to remove to wrapper topics'),
             DeclareLaunchArgument(
                 'sync_queue_size',
-                default_value='2000',
+                default_value='500',
                 description='Sync message filter queue size'),
             DeclareLaunchArgument(
                 'sync_slop',
-                default_value='0.3',
+                default_value='0.05',
                 description='Sync message filter slop'),
+            DeclareLaunchArgument(
+                'seek_time_step',
+                default_value='0.5',
+                description='When the system is paused, users have the possibility to explore the data by seeking/jumping "seek_time_step" increment of time (in seconds)'),
             OpaqueFunction(function=launch_setup)
         ]
     )
