@@ -40,6 +40,8 @@ class DataSynchronizer(Node):
         self.namespace = self.declare_parameter("namespace", "").get_parameter_value().string_value
         self.camera_name = self.declare_parameter("camera_name", "").get_parameter_value().string_value
         self.prefix = self.declare_parameter("prefix","").get_parameter_value().string_value
+        self.bag_storage_id = self.declare_parameter("bag_storage_id", "").get_parameter_value().string_value
+        self.bag_topic_prefix = self.declare_parameter("bag_topic_prefix", "/bag").get_parameter_value().string_value
 
         if self.namespace == "":
             self.namespace = self.camera_name+'/zed_node'
@@ -103,7 +105,8 @@ class DataSynchronizer(Node):
 
         # Create rosbag reader
         self.reader = rosbag2_py.SequentialReader()
-        storage_options = rosbag2_py.StorageOptions(uri=self.bag_path, storage_id='sqlite3')
+        storage_id = self.detect_storage_id(self.bag_path)
+        storage_options = rosbag2_py.StorageOptions(uri=self.bag_path, storage_id=storage_id)
         converter_options = rosbag2_py.ConverterOptions('', '')
         self.reader.open(storage_options, converter_options)
         self.rosbag_current_timestamp = 0.0 
@@ -115,6 +118,9 @@ class DataSynchronizer(Node):
 
         # Get all topic types
         self.topic_types = {topic.name: topic.type for topic in self.reader.get_all_topics_and_types()}
+
+        self.get_logger().info(f"Topics loaded from ROS Bag: {self.rosbag_topic_publishers.keys()}")
+        self.get_logger().info(f"Topic types loaded from ROS Bag: {self.topic_types}")
 
         #Only read topics that are requested 
         topics = list(self.rosbag_topic_publishers.keys())
@@ -176,8 +182,20 @@ class DataSynchronizer(Node):
 
         ############################################################################################
 
-    
-    def get_qos_profiles_from_bag(self,bag_path, topic_name):
+    def detect_storage_id(self, bag_path: str) -> str:
+        meta = os.path.join(bag_path, "metadata.yaml")
+        if not os.path.exists(meta):
+            # If someone passed a single file (rare) or metadata missing, fallback:
+            return "sqlite3"
+
+        with open(meta, "r") as f:
+            md = yaml.safe_load(f)
+
+        info = md.get("rosbag2_bagfile_information", {})
+        sid = info.get("storage_identifier", "")
+        return sid if sid else "sqlite3"
+
+    def get_qos_profiles_from_bag(self, bag_path, topic_name):
         metadata_file = os.path.join(bag_path, 'metadata.yaml')
         if not os.path.exists(metadata_file):
             raise FileNotFoundError("metadata.yaml not found in bag path")
@@ -185,29 +203,28 @@ class DataSynchronizer(Node):
         with open(metadata_file, 'r') as f:
             metadata = yaml.safe_load(f)
 
-        for topic in metadata['rosbag2_bagfile_information']['topics_with_message_count']:
+        topics = metadata.get('rosbag2_bagfile_information', {}).get('topics_with_message_count', [])
+        for topic in topics:
             name = topic['topic_metadata']['name']
-            if name == topic_name:
-                qos_profiles_str = topic['topic_metadata']['offered_qos_profiles']
-                qos_profiles = yaml.safe_load(qos_profiles_str)[0]  # Usually a list with one dict
-                depth = qos_profiles.get('depth', 10)
-                reliability = qos_profiles.get('reliability', 'RELIABLE')
-                durability = qos_profiles.get('durability', 'VOLATILE')
+            if name != topic_name:
+                continue
 
-                qos_profile = QoSProfile(
-                    depth=depth,
-                    reliability=reliability,
-                    durability=durability
-                )
+            qos_profiles_str = topic['topic_metadata'].get('offered_qos_profiles', '')
+            qos_list = yaml.safe_load(qos_profiles_str) if qos_profiles_str else []
+            qos0 = qos_list[0] if qos_list else {}
 
-                self.get_logger().debug(f"  Reliability     : {qos_profile.reliability.name}")
-                self.get_logger().debug(f"  Durability      : {qos_profile.durability.name}")
-                self.get_logger().debug(f"  Depth           : {qos_profile.depth}")
-                return qos_profile
+            depth = int(qos0.get('depth', 10))
+
+            rel = str(qos0.get('reliability', 'RELIABLE')).upper()
+            reliability = QoSReliabilityPolicy.RELIABLE if rel == 'RELIABLE' else QoSReliabilityPolicy.BEST_EFFORT
+
+            dur = str(qos0.get('durability', 'VOLATILE')).upper()
+            durability = QoSDurabilityPolicy.TRANSIENT_LOCAL if dur == 'TRANSIENT_LOCAL' else QoSDurabilityPolicy.VOLATILE
+
+            return QoSProfile(depth=depth, reliability=reliability, durability=durability)
 
         raise ValueError(f"Topic {topic_name} not found in bag metadata.")
 
-    
     def initial_timestamp_match(self):
 
         ## waiting for SVO to start playing 
@@ -511,13 +528,26 @@ class DataSynchronizer(Node):
         for topic in topic_list:
             try:
                 msg_type = get_message(topic["type"])
-                subscriber = message_filters.Subscriber(self, msg_type, "/bag"+topic["name"])
-                self.sync_subscribers.append(subscriber)
+                bag_in_name = self.bag_topic_prefix + topic["name"]
+
+                # QoS from bag (this is what your publisher uses)
                 qos = self.get_qos_profiles_from_bag(self.bag_path, topic["name"])
-                publisher = self.create_publisher(msg_type, topic["name"], qos)
-                self.sync_topic_publishers[topic["name"]] = publisher
-                publisher = self.create_publisher(msg_type, "/bag"+topic["name"], qos)
-                self.rosbag_topic_publishers[topic["name"]] = publisher
+
+                # IMPORTANT: make the message_filters subscriber request the SAME QoS
+                subscriber = message_filters.Subscriber(
+                    self,
+                    msg_type,
+                    bag_in_name,
+                    qos_profile=qos,  # <-- THIS FIXES THE RELIABILITY MISMATCH
+                )
+                self.sync_subscribers.append(subscriber)
+
+                # Publish the synchronized output (usually on original name)
+                self.sync_topic_publishers[topic["name"]] = self.create_publisher(msg_type, topic["name"], qos)
+
+                # Publish bag replay into /bag/...
+                self.rosbag_topic_publishers[topic["name"]] = self.create_publisher(msg_type, bag_in_name, qos)
+
                 self.get_logger().info(f"Created publisher for {topic['name']} [{topic['type']}]")
 
             except Exception as e:
