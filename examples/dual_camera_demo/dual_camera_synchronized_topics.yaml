@@ -1,0 +1,13 @@
+sync_node:
+  zed_wrapper_topics:
+    - name: "/zed_multi/zed_front/point_cloud/cloud_registered"
+      type: "sensor_msgs/msg/PointCloud2"
+    - name: "/zed_multi/zed_front/rgb/color/rect/image"
+      type: "sensor_msgs/Image"
+    - name: "/zed_multi/zed_back/rgb/color/rect/image"
+      type: "sensor_msgs/Image" 
+    - name: "/zed_multi/zed_back/point_cloud/cloud_registered"
+      type: "sensor_msgs/msg/PointCloud2"
+  rosbag_topics:
+    - name: "/ldlidar_node/scan"
+      type: "sensor_msgs/msg/LaserScan"

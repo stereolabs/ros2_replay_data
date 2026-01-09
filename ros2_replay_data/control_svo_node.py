@@ -169,6 +169,7 @@ class SVOController(Node):
                     self.svo_current_frame = self.svo_current_frame+1
                 except Exception as e:
                     self.get_logger().error(f'Service call failed: {e}')
+                time.sleep(0.5)
             elif key == keyboard.Key.up:
                 #move svo to the next frame
                 self.rate = self.rate + self.rate_increment

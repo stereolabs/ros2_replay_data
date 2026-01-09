@@ -22,17 +22,18 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
-    ] + package_files('examples') + package_files('rviz'),
+    ] + package_files('examples') + package_files('rviz') + package_files('urdf'),
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='stereolabs',
     maintainer_email='support@stereolabs.com',
-    description='Package allowing to sync data between a ROS Wrapper and a ROS2 bag',
+    description='Package allowing to sync data between a SVO and a ROS2 bag',
     license='Stereolabs',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
         'sync_node = ros2_replay_data.sync_node:main',
+        'dual_camera_sync_node = ros2_replay_data.dual_camera_sync_node:main',
         'control_svo_node = ros2_replay_data.control_svo_node:main'
         ],
     },
