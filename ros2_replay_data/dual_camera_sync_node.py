@@ -142,7 +142,11 @@ class DataSynchronizer(Node):
 
         # Create rosbag reader
         self.reader = rosbag2_py.SequentialReader()
-        storage_options = rosbag2_py.StorageOptions(uri=self.bag_path, storage_id='sqlite3')
+        ##Get storage identifier
+        info = rosbag2_py.Info()
+        metadata = info.read_metadata(self.bag_path, "")
+        storage_id = metadata.storage_identifier
+        storage_options = rosbag2_py.StorageOptions(uri=self.bag_path, storage_id=storage_id)
         converter_options = rosbag2_py.ConverterOptions('', '')
         self.reader.open(storage_options, converter_options)
         self.rosbag_current_timestamp = 0.0 
@@ -221,6 +225,13 @@ class DataSynchronizer(Node):
             name = topic['topic_metadata']['name']
             if name == topic_name:
                 qos_profiles_str = topic['topic_metadata']['offered_qos_profiles']
+                if not qos_profiles_str:
+                    # Common choice: sensor data (LaserScan, Image, Imu...) => BEST_EFFORT, VOLATILE
+                    return QoSProfile(
+                        depth=10,
+                        reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                        durability=QoSDurabilityPolicy.VOLATILE
+                    )
                 qos_profiles = yaml.safe_load(qos_profiles_str)[0]  # Usually a list with one dict
                 depth = qos_profiles.get('depth', 10)
                 reliability = qos_profiles.get('reliability', 'RELIABLE')
