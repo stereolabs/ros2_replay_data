@@ -272,8 +272,8 @@ class DataSynchronizer(Node):
                 best_idx = min(range(len(buffer)), key=lambda i: abs(buffer[i][0] - target_ts))
                 diff = abs(buffer[best_idx][0] - target_ts)
                 
-                self.get_logger().info(f"topic name: {topic_name}")
-                self.get_logger().info(f"diff: {diff}")
+                self.get_logger().debug(f"topic name: {topic_name}")
+                self.get_logger().debug(f"diff: {diff}")
                 if diff <= self.sync_slop:
                     msg_to_pub = buffer[best_idx][1]
                     self.sync_publishers[topic_name].publish(msg_to_pub)
