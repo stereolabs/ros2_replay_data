@@ -1,218 +1,88 @@
 import rclpy
 from rclpy.node import Node
-import message_filters
 import yaml
+import threading
+from time import sleep, time
+from pynput import keyboard
+import os
 from sensor_msgs.msg import *
-from diagnostic_msgs.msg import *
-from std_msgs.msg import *
-from geometry_msgs.msg import *
 from zed_msgs.msg import *
 from zed_msgs.srv import *
 from std_srvs.srv import Trigger
-from rosidl_runtime_py.utilities import get_message
-import sys
-import os
-import time
-import threading
-from pynput import keyboard
-from rclpy.serialization import deserialize_message
-import rosbag2_py
-from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
-from rclpy.parameter import Parameter
 from rcl_interfaces.srv import SetParameters
-from time import sleep, time
-from threading import Thread
+from rclpy.parameter import Parameter
+from rclpy.serialization import deserialize_message
+from rosidl_runtime_py.utilities import get_message
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
+import rosbag2_py
 
 class DataSynchronizer(Node):
     def __init__(self):
-        super().__init__('dual_camera_sync_data_replay_node')
+        super().__init__('dual_camera_sync_node')
 
-        ## This sync node aims at synchronizing topics taken from a svo file and a rosbag. Users set up the topics they wish to sync together in a yaml file. 
-        ## The rosbag is replayed directly from the node. The SVO is replayed in the ZED ROS wrapper with any camera parameters. Synchronized topics are published by the sync node. 
-        ## SVOs are replayed in non realtime, and the replay rate in the wrapper is adjusted 
-        ## At any time, users can press the keyboard "space" key to pause the replay of SVO/ ROS BAG and use the right arrow key to advance frame by frame while keeping the rosbag and svo topics synchronized.
+        # --- Parameters ---
+        self.bag_path = self.declare_parameter("bag_path", "").value
+        self.yaml_file = self.declare_parameter("synchronized_topic_config_file", "").value
+        self.namespace = self.declare_parameter("namespace", "").value
+        self.camera_name_1 = self.declare_parameter('camera_name_1', 'zed1').value
+        self.camera_name_2 = self.declare_parameter('camera_name_2', 'zed1').value
+        self.seek_time_step = self.declare_parameter("seek_time_step", 0.5).value
+        self.prefix = self.declare_parameter("prefix","").value
 
-        ################################### CLASS PARAMETERS #########################################
-        # Get parameters (bag path and launcher param file)
-        self.bag_path = self.declare_parameter("bag_path", "").get_parameter_value().string_value
-        self.yaml_file = self.declare_parameter("synchronized_topic_config_file", "").get_parameter_value().string_value
-        self.namespace = self.declare_parameter("namespace", "").get_parameter_value().string_value
-        self.camera_name_1 = self.declare_parameter("camera_name_1", "").get_parameter_value().string_value
-        self.camera_name_2 = self.declare_parameter("camera_name_2", "").get_parameter_value().string_value
-        self.prefix = self.declare_parameter("prefix","").get_parameter_value().string_value
-        self.camera_1_namespace = ""
-        self.camera_2_namespace = ""
+        self.camera_1_ns = ""
+        self.camera_2_ns = ""
+
         if self.namespace == "":
-            self.camera_1_namespace = self.camera_name_1+'/zed_node'
-            self.camera_2_namespace = self.camera_name_2+'/zed_node'
+            self.camera_1_ns = self.camera_name_1+'/zed_node'
+            self.camera_2_ns = self.camera_name_2+'/zed_node'
         else:
-            self.camera_1_namespace = self.namespace+'/'+self.camera_name_1
-            self.camera_2_namespace = self.namespace+'/'+self.camera_name_2
-        self.sync_queue_size = self.declare_parameter("sync_queue_size", 500).get_parameter_value().integer_value
-        self.sync_slop = self.declare_parameter("sync_slop", 0.05).get_parameter_value().double_value
-        self.seek_time_step = self.declare_parameter("seek_time_step", 0.5).get_parameter_value().double_value
-
-        if not self.bag_path or not self.yaml_file:
-            self.get_logger().error("Missing parameters: bag_path or yaml_file")
-            sys.exit(1)
-
-        #####################################TOPIC SUBSCRIBERS/PUBLISHERS#############################
-
-        # Initialize publishers and subscribers
-        self.sync_subscribers = []
-        self.rosbag_topic_publishers = {}
-        self.sync_topic_publishers = {}
-
-        ############################################################################################
-
-        ################################### SVOs REPLAY #############################################
-
-        # Load topics from ZED wrapper to synchronize (list of topics present in the yaml config file)
-        self.load_wrapper_topics(self.yaml_file)
-
-        ########Set Up Svo topics / services
-
-        #####Camera 1
-        self.svo1_status_sub = self.create_subscription(SvoStatus,'/'+self.camera_1_namespace+'/status/svo',self.svo1_callback,10)
-        self.svo1_current_frame = 0
-        self.svo1_current_timestamp = 0.0
-        self.svo1_started = False
-
-        #Service to modify SVO replay rate
-        self.cli_svo1 = self.create_client(SetParameters, '/'+self.camera_1_namespace+'/set_parameters')
-
-        while not self.cli_svo1.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('Waiting for'+ '/'+self.camera_1_namespace+'/set_parameters service...')
-
-        #Service to pause the SVO
-        self.svo1_pause_client = self.create_client(Trigger, '/'+self.camera_1_namespace+'/toggle_svo_pause')
-        while not self.svo1_pause_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('Waiting for service /'+self.camera_1_namespace+'/toggle_svo_pause...')
-        self.pause_request_svo1 = Trigger.Request()
-
-        #Service to set frame position on SVO
-        self.set_svo1_frame_position_client = self.create_client(SetSvoFrame, '/'+self.camera_1_namespace+'/set_svo_frame')
-        while not self.set_svo1_frame_position_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('Waiting for service'+ '/'+self.camera_1_namespace+'/set_svo_frame...')
-        self.frame_request_svo1 = SetSvoFrame.Request()
-
-        #####Camera 2
-        self.svo2_status_sub = self.create_subscription(SvoStatus,'/'+self.camera_2_namespace+'/status/svo',self.svo2_callback,10)
-        self.svo2_current_frame = 0
-        self.svo2_current_timestamp = 0.0
-        self.svo2_started = False
-
-        #Service to modify SVO replay rate
-        self.cli_svo2 = self.create_client(SetParameters, '/'+self.camera_2_namespace+'/set_parameters')
-
-        while not self.cli_svo2.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('Waiting for'+ '/'+self.camera_2_namespace+'/set_parameters service...')
-
-        #Service to pause the SVO
-        self.svo2_pause_client = self.create_client(Trigger, '/'+self.camera_2_namespace+'/toggle_svo_pause')
-        while not self.svo2_pause_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('Waiting for service /'+self.camera_2_namespace+'/toggle_svo_pause...')
-        self.pause_request_svo2 = Trigger.Request()
-
-        #Service to set frame position on SVO
-        self.set_svo2_frame_position_client = self.create_client(SetSvoFrame, '/'+self.camera_2_namespace+'/set_svo_frame')
-        while not self.set_svo2_frame_position_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('Waiting for service'+ '/'+self.camera_2_namespace+'/set_svo_frame...')
-        self.frame_request_svo2 = SetSvoFrame.Request()
-
-        # SVO Replay Rate parameters
-        self.rate_svo1 = 1.0
-        self.rate_svo2 = 1.0
-        self.kp = 0.02  # Proportional gain
-
-        ############################################################################################
-
-        ################################### KEYBOARD THREAD ########################################
-
+            self.camera_1_ns = self.namespace+'/'+self.camera_name_1
+            self.camera_2_ns = self.namespace+'/'+self.camera_name_2
+            
         
-        # Start a separate thread to listen for keyboard input
-        self.keyboard_thread = threading.Thread(target=self.listen_for_keypress, daemon=True)
-        self.keyboard_thread.start()
+        
+        self.sync_slop = self.declare_parameter("sync_slop", 0.05).value # 50ms window
+        self.sync_buffer_time = self.declare_parameter("sync_buffer_time", 2.0).value # 2.0s buffer window
 
-        ############################################################################################
+        # --- Data Structures ---
+        # topic_name -> [(timestamp, message_object), ...]
+        self.topic_buffers = {} 
+        self.buffer_lock = threading.Lock()
+        
+        self.svo_status = {
+            'cam1': {'ts': 0.0, 'frame': 0, 'started': False},
+            'cam2': {'ts': 0.0, 'frame': 0, 'started': False}
+        }
+        
+        self.rosbag_ts = 0.0
+        self.is_paused = False
+        self.reset_playback_clock = False
 
-
-        ################################### ROSBAG REPLAY ##########################################
-
-        # Create rosbag reader
+        # --- Initialize Components ---
+        self.sync_publishers = {}
+        self.rosbag_publishers = {}
+        
+        
+        # --- Initialize Rosbag ---
         self.reader = rosbag2_py.SequentialReader()
-        ##Get storage identifier
         info = rosbag2_py.Info()
-        metadata = info.read_metadata(self.bag_path, "")
-        storage_id = metadata.storage_identifier
-        storage_options = rosbag2_py.StorageOptions(uri=self.bag_path, storage_id=storage_id)
-        converter_options = rosbag2_py.ConverterOptions('', '')
-        self.reader.open(storage_options, converter_options)
-        self.rosbag_current_timestamp = 0.0 
-        self.rosbag_started = False
-        self.rosbag_has_catched_up = False
+        self.metadata = info.read_metadata(self.bag_path, "")
+        self.reader.open(
+            rosbag2_py.StorageOptions(uri=self.bag_path, storage_id=self.metadata.storage_identifier),
+            rosbag2_py.ConverterOptions('', '')
+        )
+        self.bag_types = {t.name: t.type for t in self.reader.get_all_topics_and_types()}
 
-        # Load topics from ROS Bag to synchronize (list of topics present in the yaml config file)
-        self.load_rosbag_topics(self.yaml_file)
+        # --- Initialize Clients ---
+        self.init_svo_clients()
 
-        # Get all topic types
-        self.topic_types = {topic.name: topic.type for topic in self.reader.get_all_topics_and_types()}
+        # --- Load Configs ---
+        self.load_config(self.yaml_file)
 
-        #Only read topics that are requested 
-        topics = list(self.rosbag_topic_publishers.keys())
-        self.reader.set_filter(rosbag2_py._storage.StorageFilter(topics=topics))
+        # --- Background Threads ---
+        threading.Thread(target=self.playback_loop, daemon=True).start()
+        threading.Thread(target=self.keyboard_controller, daemon=True).start()
 
-        # Initialize pause flag
-        self.svo1_paused = False 
-        self.svo2_paused = False 
-        self.rosbag_paused = False
-        self.keyboard_paused = False 
-        self.system_initialized = False
-
-        # Initialize rosbag rate
-        self.rosbag_rate = 1.0 
-        self.reset_time = False
-
-         # Launch rosbag playback in a background thread
-        self.playback_thread = Thread(target=self.play, daemon=True)
-        self.playback_thread.start()
-
-        ############################################################################################
-
-         ################################### DATA SYNC ###############################################
-  
-        # Synchronize messages with ApproximateTimeSynchronizer
-        if self.sync_subscribers:
-            self.sync = message_filters.ApproximateTimeSynchronizer(self.sync_subscribers, self.sync_queue_size, self.sync_slop, allow_headerless=True)
-            self.sync.registerCallback(self.synchronized_callback)
-
-       ############################################################################################
-
-       ############################################################################################
-
-
-
-        # Print initial configuration
-        self.get_logger().info("=====================================================")
-        self.get_logger().info(f" Node '{self.get_name()}' started")
-        self.get_logger().info(f" Namespace Camera 1: {self.camera_1_namespace}")
-        self.get_logger().info(f" Namespace Camera 2: {self.camera_2_namespace}")
-        self.get_logger().info(f"Opening ROS2 bag: {self.bag_path}")
-        self.get_logger().info(f"Opening synchronized topic yaml file: {self.yaml_file}")
-        self.get_logger().info(f"Sync queue size: {self.sync_queue_size}")
-        self.get_logger().info(f"Sync slop: {self.sync_slop}")
-        self.get_logger().info(f"Seek time step increment: {self.seek_time_step}")
-        self.get_logger().info(" Keyboard controls:")
-        self.get_logger().info("   [Space] Pause/Resume")
-        self.get_logger().info("   [→]     Next Rosbag message (when paused)")
-        self.get_logger().info("   [↑]     Increase seek time step increment")
-        self.get_logger().info("   [↓]     Decrease seek time step increment")
-        self.get_logger().info("=====================================================")
-
-        ############################################################################################
-
-    
     def get_qos_profiles_from_bag(self,bag_path, topic_name):
         metadata_file = os.path.join(bag_path, 'metadata.yaml')
         if not os.path.exists(metadata_file):
@@ -234,7 +104,7 @@ class DataSynchronizer(Node):
                     )
                 qos_profiles = yaml.safe_load(qos_profiles_str)[0]  # Usually a list with one dict
                 depth = qos_profiles.get('depth', 10)
-                reliability = qos_profiles.get('reliability', 'RELIABLE')
+                reliability = qos_profiles.get('reliability', 'BEST_EFFORT')
                 durability = qos_profiles.get('durability', 'VOLATILE')
 
                 qos_profile = QoSProfile(
@@ -250,370 +120,251 @@ class DataSynchronizer(Node):
 
         raise ValueError(f"Topic {topic_name} not found in bag metadata.")
 
-    def svo1_callback(self, msg):
-        """Gives information about the current SVO status. The SVO timestamp is compared with the rosbag timestamp all the time to ensure they are not diverging too much. 
-        If the svo is much faster than the rosbag, its replay rate is reduced by adjusting a dynamic ROS wrapper parameter. If the svo is much slower than the rosbag replay rate, its replay rate is increased.""" 
- 
-        if self.svo1_started is False:
-            self.svo1_started = True
-            self.reset_time = True
-            self.svo1_current_frame = msg.frame_id
-            self.svo1_current_timestamp = msg.frame_ts* 1e-9
-            #Initialize the system with both svo and rosbag having timestamp match
-            #self.initial_timestamp_match()
+    def load_config(self, yaml_file):
+        with open(yaml_file, 'r') as f:
+            config = yaml.safe_load(f)
+        
+        # 1. Setup SVO Topics (Sub from Wrapper -> Buffer -> Sync Publish)
+        for topic in config['sync_node'].get('zed_wrapper_topics', []):
+            m_type = get_message(topic['type'])
+
+            if self.prefix == "":
+                t_name = '/sync'+topic["name"]
+            else:
+                t_name = topic["name"].removeprefix(self.prefix)
             
-
-        
-        self.svo1_current_frame = msg.frame_id
-        self.svo1_current_timestamp = msg.frame_ts* 1e-9
-        #self.get_logger().info(f"SVO 1 current frame : {self.svo1_current_frame}")
-        #self.get_logger().info(f"SVO 1  current timestamp : {self.svo1_current_timestamp}")
-        #self.get_logger().info(f"ROSBAG current timestamp : {self.rosbag_current_timestamp}")
-        if self.svo1_paused:
-            ## if the ROSbag/ SVO replyay is paused, no need to adjust the rate
-            return
-
-        ## Calculating difference between both ROSbag / SVO timestamps
-        ## The new rate is adjusted based on a PI controller logic whose parameters can be tuned. 
-        error = self.rosbag_current_timestamp - self.svo1_current_timestamp
-        self.get_logger().info(f"Time difference between SVO 1 and rosbag : {error}")
-        if abs(error)<0.25:
-            self.rate_svo1 = 1
-        adjustment = self.kp * error 
-        self.rate_svo1 += adjustment
-        ## Cap rate between [0.1,5]
-        self.rate_svo1 = max(0.1, min(5, self.rate_svo1))
-        self.get_logger().info(f"SVO 1 rate : {self.rate_svo1}")
-        param = Parameter(name='svo.replay_rate', value=self.rate_svo1)
-        req = SetParameters.Request()
-        req.parameters = [param.to_parameter_msg()]
-
-        ## As the new rate is calculated, it is sent to the wrapper.
-
-        ##call set SVO replay rate
-        try:
-          self.rate_service_call = self.cli_svo1.call_async(req)
-          response = self.rate_service_call.result()
-          self.get_logger().debug(f"SVO 1  rate service call")
-        except Exception as e:
-          self.get_logger().error(f'Service call failed: {e}')
-        
-
-    def svo2_callback(self, msg):
-        """Gives information about the current SVO status. The SVO timestamp is compared with the rosbag timestamp all the time to ensure they are not diverging too much. 
-        If the svo is much faster than the rosbag, its replay rate is reduced by adjusting a dynamic ROS wrapper parameter. If the svo is much slower than the rosbag replay rate, its replay rate is increased.""" 
- 
-        if self.svo2_started is False:
-            self.svo2_started = True
-            self.reset_time = True
-            self.svo2_current_frame = msg.frame_id
-            self.svo2_current_timestamp = msg.frame_ts* 1e-9
-            #Initialize the system with both svo and rosbag having timestamp match
-            #self.initial_timestamp_match()
+            # Buffer the incoming wrapper data
+            self.topic_buffers[t_name] = []
+            self.create_subscription(m_type, topic['name'], 
+                lambda msg, tn=t_name: self._buffer_cb(tn, msg), 10)
             
+            # Output synced topic
+            self.sync_publishers[t_name] = self.create_publisher(m_type, f"{t_name}", 10)
 
+        # 2. Setup Rosbag Topics
+        for topic_info in self.metadata.topics_with_message_count:
+            topic_name = topic_info.topic_metadata.name
+            topic_type = topic_info.topic_metadata.type
+    
+            try:
+                # Dynamically import the message type
+                m_type = get_message(topic_type)
+
+                #Retrieve Qos Profile
+                qos = self.get_qos_profiles_from_bag(self.bag_path, topic_name)
         
-        self.svo2_current_frame = msg.frame_id
-        self.svo2_current_timestamp = msg.frame_ts* 1e-9
-        #self.get_logger().info(f"SVO2 current frame : {self.svo2_current_frame}")
-        #self.get_logger().info(f"SVO2 current timestamp : {self.svo2_current_timestamp}")
-        #self.get_logger().info(f"ROSBAG current timestamp : {self.rosbag_current_timestamp}")
-        if self.svo2_paused:
-            ## if the ROSbag/ SVO replyay is paused, no need to adjust the rate
-            return
-
-        ## Calculating difference between both ROSbag / SVO timestamps
-        ## The new rate is adjusted based on a PI controller logic whose parameters can be tuned. 
-        error = self.rosbag_current_timestamp - self.svo2_current_timestamp
-        self.get_logger().info(f"Time difference between SVO 2 and rosbag : {error}")
-        if abs(error)<0.25:
-            self.rate_svo2 = 1
-        adjustment = self.kp * error 
-        self.rate_svo2 += adjustment
-        ## Cap rate between [0.1,5]
-        self.rate_svo2 = max(0.1, min(5, self.rate_svo2))
-        self.get_logger().info(f"SVO 2 rate : {self.rate_svo2}")
-        param = Parameter(name='svo.replay_rate', value=self.rate_svo2)
-        req = SetParameters.Request()
-        req.parameters = [param.to_parameter_msg()]
-
+                # Create and store the publisher
+                self.rosbag_publishers[topic_name] = self.create_publisher(
+                    m_type, 
+                    topic_name, 
+                    qos
+                )
+                self.get_logger().info(f"Created publisher for {topic_name} [{topic_type}]")
         
+            except (ImportError, AttributeError) as e:
+                self.get_logger().error(f"Could not import message type {topic_type}: {e}")
 
-        ## As the new rate is calculated, it is sent to the wrapper.
-
-        ##call set SVO replay rate
-        try:
-          self.rate_service_call = self.cli_svo2.call_async(req)
-          response = self.rate_service_call.result()
-          self.get_logger().debug(f"SVO 2 rate service call")
-        except Exception as e:
-          self.get_logger().error(f'Service call failed: {e}')
+    def _buffer_cb(self, topic_name, msg):
+        """Standardizes all incoming camera data into a time-sorted buffer."""
+        if not hasattr(msg, 'header'): return
+        ts = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         
-    def listen_for_keypress(self):
-        """Listen for spacebar press to toggle pause"""
-        def on_press(key):
-            sleep(0.5)
-            if key == keyboard.Key.space:
-                self.keyboard_paused = not self.keyboard_paused
-                state = "Paused" if self.keyboard_paused else "Resumed"
-                self.get_logger().info(f"[KEYBOARD] {state}")
-                ## Pause/Unpause SVO 1
-                try:
-                  self.pause_service_call = self.svo1_pause_client.call_async(self.pause_request_svo1)
-                  response = self.pause_service_call.result()
-                  self.get_logger().debug(f"SVO Toggle pause service call")
-                except Exception as e:
-                  self.get_logger().error(f'Service call failed: {e}')
-                ## Pause/Unpause SVO 2
-                try:
-                  self.pause_service_call = self.svo2_pause_client.call_async(self.pause_request_svo2)
-                  response = self.pause_service_call.result()
-                  self.get_logger().debug(f"SVO Toggle pause service call")
-                except Exception as e:
-                  self.get_logger().error(f'Service call failed: {e}')
-                if state == "Resumed":
-                     self.reset_time = True
-                     self.rosbag_paused = False
-                     self.svo1_paused = False
-                     self.svo2_paused = False
-                     self.rosbag_has_catched_up = False
-                elif state == "Paused":
-                     self.rosbag_paused = True
-                     self.svo1_paused = True
-                     self.svo2_paused = True
-            elif key == keyboard.Key.right:
-                ## When the SVO is paused, it is possible to seek by a time step increment when the right arrow key button is pressed.
-                #if not self.rosbag_has_catched_up:
-                 #   self.seek_rosbag()
-                #else: 
-                    #self.seek_if_catchup()
-                self.seek()
-            elif key == keyboard.Key.up:
-                self.seek_time_step = self.seek_time_step + 0.1
-                self.get_logger().info(f"Seek time increment has increased to: {self.seek_time_step}")
-            elif key == keyboard.Key.down:
-                self.seek_time_step = self.seek_time_step - 0.1
-                if self.seek_time_step < 0.1:
-                    self.seek_time_step = 0.1
-                self.get_logger().info(f"Seek time increment has increased to: {self.seek_time_step}")
+        with self.buffer_lock:
+            self.topic_buffers[topic_name].append((ts, msg))
+            
+            while len(self.topic_buffers[topic_name]) > 0 and (ts - self.topic_buffers[topic_name][0][0] > self.sync_buffer_time):
+                self.topic_buffers[topic_name].pop(0)
+
+    def init_svo_clients(self):
+        # Using naming convention from your previous code
+
+        self.create_subscription(SvoStatus, f"{self.camera_1_ns}/status/svo", lambda m: self._svo_status_cb('cam1', m, self.camera_1_ns), 10)
+        self.create_subscription(SvoStatus, f"{self.camera_2_ns}/status/svo", lambda m: self._svo_status_cb('cam2', m, self.camera_2_ns), 10)
+        
+        self.cli_rate = {
+            'cam1': self.create_client(SetParameters, f"{self.camera_1_ns}/set_parameters"),
+            'cam2': self.create_client(SetParameters, f"{self.camera_2_ns}/set_parameters")
+        }
+
+        self.cli_svo1_seek = self.create_client(SetSvoFrame, f"{self.camera_1_ns}/set_svo_frame")
+        self.cli_svo2_seek = self.create_client(SetSvoFrame, f"{self.camera_2_ns}/set_svo_frame")
+
+        self.cli_svo1_pause = self.create_client(Trigger, '/'+self.camera_1_ns+'/toggle_svo_pause')
+        self.cli_svo2_pause = self.create_client(Trigger, '/'+self.camera_2_ns+'/toggle_svo_pause')
+
+    def _svo_status_cb(self, cam_id, msg, ns):
+        self.svo_status[cam_id] = {'ts': msg.frame_ts * 1e-9, 'frame': msg.frame_id, 'started': True}
+        
+        # Adjust SVO rate to catch up to Rosbag
+        if not self.is_paused and self.rosbag_ts > 0:
+            error = self.rosbag_ts - self.svo_status[cam_id]['ts']
+            # Simple P-control: base rate 1.0 + (error * gain)
+            target_rate = max(0.2, min(4.0, 1.0 + (error * 1.5)))
+            req = SetParameters.Request()
+            req.parameters = [Parameter(name='svo.replay_rate', value=target_rate).to_parameter_msg()]
+            self.cli_rate[cam_id].call_async(req)
+
+    def playback_loop(self):
+        """Master clock thread with Drift Guard."""
+        first_bag_ts = None
+        wall_start = time()
+        
+        # Max allowed lead (in seconds) before the Rosbag pauses to wait for SVOs
+        MAX_DRIFT = 0.25 
+
+        while rclpy.ok():
+            # 1. Manual Pause or Waiting for Initialization
+            if self.is_paused or not all(c['started'] for c in self.svo_status.values()):
+                sleep(0.05)
+                continue
+
+            # 2. DRIFT GUARD: Check if Rosbag is too far ahead of SVOs
+            # We look at the slowest camera to determine if we should wait
+            min_svo_ts = min(self.svo_status['cam1']['ts'], self.svo_status['cam2']['ts'])
+            
+            if self.rosbag_ts - min_svo_ts > MAX_DRIFT:
+                self.get_logger().warn(
+                    f"Rosbag is {self.rosbag_ts - min_svo_ts:.2f}s ahead. Waiting for SVOs...",
+                    throttle_duration_sec=1.0
+                )
+                self.reset_playback_clock = True # Reset timing baseline after waiting
+                sleep(0.1) 
+                continue
+
+            if not self.reader.has_next(): 
+                self.get_logger().info("End of Rosbag reached.")
+                break
+
+            # 3. Read Next Rosbag Message
+            topic, data, t_nanos = self.reader.read_next()
+            msg_class = get_message(self.bag_types[topic])
+            msg = deserialize_message(data, msg_class)
+            self.rosbag_ts = t_nanos * 1e-9
+
+            # 4. Real-time Pacing Logic
+            if first_bag_ts is None or self.reset_playback_clock:
+                first_bag_ts = self.rosbag_ts
+                wall_start = time()
+                self.reset_playback_clock = False
+            
+            elapsed_bag_time = self.rosbag_ts - first_bag_ts
+            elapsed_wall_time = time() - wall_start
+            
+            wait_time = elapsed_bag_time - elapsed_wall_time
+            if wait_time > 0:
+                sleep(wait_time)
+
+            # 5. Publish Rosbag Topic
+            if topic in self.rosbag_publishers:
+                self.rosbag_publishers[topic].publish(msg)
+
+            # 6. Synchronize and Publish SVO Topics
+            # This looks into the buffers for messages closest to 'self.rosbag_ts'
+            self.sync_and_publish_all(self.rosbag_ts)
+
+    def sync_and_publish_all(self, target_ts):
+        """Searches all SVO buffers for the closest match to the current Bag time."""
+        with self.buffer_lock:
+            for topic_name, buffer in self.topic_buffers.items():
+                if not buffer: continue
                 
+                # Find index of closest timestamp
+                best_idx = min(range(len(buffer)), key=lambda i: abs(buffer[i][0] - target_ts))
+                diff = abs(buffer[best_idx][0] - target_ts)
+                
+                self.get_logger().info(f"topic name: {topic_name}")
+                self.get_logger().info(f"diff: {diff}")
+                if diff <= self.sync_slop:
+                    msg_to_pub = buffer[best_idx][1]
+                    self.sync_publishers[topic_name].publish(msg_to_pub)
+
+
+
+    def step_forward(self):
+        """Advances Bag and SVOs to a Target Time (Current + Increment)."""
+        if not self.is_paused:
+            self.get_logger().warn("Seek only works when paused.")
+            return
+
+        # 1. Define Target Time
+        # We base it on the smallest current timestamp to ensure no source is left behind
+        current_min_ts = min(self.svo_status['cam1']['ts'], 
+                             self.svo_status['cam2']['ts'], 
+                             self.rosbag_ts)
+        
+        target_ts = current_min_ts + self.seek_time_step
+        self.get_logger().info(f"Seeking to target: {target_ts:.3f} (+{self.seek_time_step}s)")
+
+        # 2. Advance Rosbag to Target
+        # We keep reading messages until we reach or slightly exceed the target time
+        while self.rosbag_ts < target_ts and self.reader.has_next():
+            topic, data, t_nanos = self.reader.read_next()
+            self.rosbag_ts = t_nanos * 1e-9
+            
+            # Publish messages as we go so the state updates (e.g. TF, Odom)
+            msg_class = get_message(self.bag_types[topic])
+            msg = deserialize_message(data, msg_class)
+            if topic in self.rosbag_publishers:
+                self.rosbag_publishers[topic].publish(msg)
+
+        # 3. Advance SVOs to Target
+        # We calculate how many frames to jump based on a standard 30fps, 
+        # or we can simply increment. To be precise, we call the seek service.
+        for cam_id in ['cam1', 'cam2']:
+            
+            while self.svo_status[cam_id]['ts'] < target_ts:
+            
+                target_frame = self.svo_status[cam_id]['frame'] + 1
+                req = SetSvoFrame.Request()
+                req.frame_id = target_frame
+                
+                client = self.cli_svo1_seek if cam_id == 'cam1' else self.cli_svo2_seek
+                client.call_async(req)
+                self.get_logger().info(f"Jumping {cam_id} to frame {target_frame}")
+
+                # 4. Final Sync Flush
+                # Give the SVO wrapper a moment to publish the frames at the new position
+                sleep(0.2) 
+                self.sync_and_publish_all(self.rosbag_ts)
+        self.get_logger().info("Seek complete.")
+
+    def keyboard_controller(self):
+        """Keyboard listener handling seek and increment adjustment."""
+        def on_press(key):
+            try:
+                if key == keyboard.Key.space:
+                    self.is_paused = not self.is_paused
+                    self.cli_svo1_pause.call_async(Trigger.Request())
+                    self.cli_svo2_pause.call_async(Trigger.Request())
+                    if not self.is_paused: self.reset_playback_clock = True
+                    self.get_logger().info(f"System {'PAUSED' if self.is_paused else 'RESUMED'}")
+                
+                elif key == keyboard.Key.right and self.is_paused:
+                    self.step_forward()
+
+                elif key == keyboard.Key.up:
+                    self.seek_time_step += 0.1
+                    self.get_logger().info(f"Seek step: {self.seek_time_step:.1f}s")
+
+                elif key == keyboard.Key.down:
+                    self.seek_time_step = max(0.1, self.seek_time_step - 0.1)
+                    self.get_logger().info(f"Seek step: {self.seek_time_step:.1f}s")
+
+            except Exception as e:
+                self.get_logger().error(f"Keyboard handling error: {e}")
+
         with keyboard.Listener(on_press=on_press) as listener:
             listener.join()
 
-    def seek(self): 
-        """In pause mode, check which svo / bag is the less advanced. and use this as reference for target time to advance data."""
-
-        #Define target time, retrieve smallest timestamp
-        timestamp = min(self.svo1_current_timestamp, self.svo2_current_timestamp, self.rosbag_current_timestamp)
-        target_time = timestamp + self.seek_time_step
-
-        self.get_logger().info(f"ROSBAG current timestamp : {self.rosbag_current_timestamp}")
-        self.get_logger().info(f"SVO1 current timestamp : {self.svo1_current_timestamp}")
-        self.get_logger().info(f"SVO2 current timestamp : {self.svo2_current_timestamp}")
-        self.get_logger().info(f"Target timestamp : {target_time}")
-
-        if not self.rosbag_paused or not self.svo1_paused or not self.svo2_paused:
-           self.get_logger().info("Rosbag / SVO need to be paused in order for the seek frame feature to work.")
-           return
-        
-        while self.rosbag_current_timestamp < target_time:
-            
-            if self.reader.has_next():
-                topic, data, t = self.reader.read_next()
-                if topic in self.topic_types:
-                    try:
-                        msg_type = self.topic_types[topic]
-                        msg_class = get_message(msg_type)
-                        msg = deserialize_message(data, msg_class)
-                        self.rosbag_current_timestamp = t * 1e-9
-
-                        if topic in self.rosbag_topic_publishers:
-                            self.rosbag_topic_publishers[topic].publish(msg)
-                            
-                    except Exception as e:
-                        self.get_logger().error(f'Error deserializing message for {topic}: {str(e)}')
-            else:
-                self.get_logger().info("Rosbag replay complete")
-        
-        while self.svo1_current_timestamp < target_time or self.svo2_current_timestamp < target_time:
-
-            if self.svo1_current_timestamp < target_time:
-                self.get_logger().debug(f"SVO1 current timestamp : {self.svo1_current_timestamp}")
-                try:
-                    self.frame_request_svo1.frame_id = self.svo1_current_frame +1
-                    self.frame_service_call = self.set_svo1_frame_position_client.call_async(self.frame_request_svo1)
-                    self.get_logger().debug(f"SVO frame position service call")
-                    self.svo1_current_frame = self.svo1_current_frame+1
-                except Exception as e:
-                    self.get_logger().error(f'Service call failed: {e}')
-                sleep(0.25)
-            
-
-            if self.svo2_current_timestamp < target_time:
-                try:
-                    self.frame_request_svo2.frame_id = self.svo2_current_frame +1
-                    self.frame_service_call = self.set_svo2_frame_position_client.call_async(self.frame_request_svo2)
-                    self.get_logger().debug(f"SVO frame position service call")
-                    self.svo2_current_frame = self.svo2_current_frame+1
-                except Exception as e:
-                    self.get_logger().error(f'Service call failed: {e}')
-                sleep(0.25)
-
-        self.get_logger().info(f"AFTER SEEK ROSBAG current timestamp : {self.rosbag_current_timestamp}")
-        self.get_logger().info(f"AFTER SEEK SVO1 current timestamp : {self.svo1_current_timestamp}")
-        self.get_logger().info(f"AFTER SEEK SVO2 current timestamp : {self.svo2_current_timestamp}")
-        self.get_logger().info(f"Target timestamp : {target_time}")
-            
-    def synchronized_callback(self, *msgs):
-        """Publish synchronized messages"""
-        if not msgs:
-            return
-
-        self.get_logger().debug(f"Publishing synchronized messages at timestamp {msgs[0].header.stamp.sec}.{msgs[0].header.stamp.nanosec}")
-
-        for topic, msg in zip(self.sync_topic_publishers.keys(), msgs):
-            self.sync_topic_publishers[topic].publish(msg)
-
-    def load_wrapper_topics(self, yaml_file):
-        """ Load topics from YAML file """
-        try:
-            with open(yaml_file, "r") as file:
-                data = yaml.safe_load(file)
-                topic_list = data.get("sync_node", {}).get("zed_wrapper_topics", [])
-        except Exception as e:
-            self.get_logger().error(f"Failed to load YAML file {yaml_file}: {str(e)}")
-            return 
-
-        if len(topic_list) == 0:
-            self.get_logger().error(f"No ZED Wrapper topics found to synchronize, exiting...")
-            sys.exit(0) 
-            return
-
-        # Dynamically create subscribers and publishers
-        for topic in topic_list:
-            try:
-                msg_type = get_message(topic["type"])
-                subscriber = message_filters.Subscriber(self, msg_type, topic["name"])
-                self.sync_subscribers.append(subscriber)
-
-                if self.prefix == "":
-                    topic_name = '/sync'+topic["name"]
-                else:
-                    topic_name = topic["name"].removeprefix(self.prefix)
-                publisher = self.create_publisher(msg_type, topic_name, 10)
-                self.sync_topic_publishers[topic["name"]] = publisher
-
-                self.get_logger().info(f"Created publisher for {topic['name']} [{topic['type']}]")
-
-            except Exception as e:
-                self.get_logger().error(f"Failed to create publisher for {topic['name']}: {str(e)}")
-        
-        return
-
-    def load_rosbag_topics(self, yaml_file):
-        """ Load rosbag topics from YAML file """
-        try:
-            with open(yaml_file, "r") as file:
-                data = yaml.safe_load(file)
-                topic_list = data.get("sync_node", {}).get("rosbag_topics", [])
-        except Exception as e:
-            self.get_logger().error(f"Failed to load YAML file {yaml_file}: {str(e)}")
-            return 
-
-        if len(topic_list) == 0:
-            self.get_logger().error(f"No ROSbag topics found to synchronize, exiting...")
-            sys.exit(0)
-            return 
-
-        # Dynamically create subscribers and publishers
-        for topic in topic_list:
-            try:
-                msg_type = get_message(topic["type"])
-                subscriber = message_filters.Subscriber(self, msg_type, "/bag"+topic["name"])
-                self.sync_subscribers.append(subscriber)
-                qos = self.get_qos_profiles_from_bag(self.bag_path, topic["name"])
-                publisher = self.create_publisher(msg_type, topic["name"], qos)
-                self.sync_topic_publishers[topic["name"]] = publisher
-                publisher = self.create_publisher(msg_type, "/bag"+topic["name"], qos)
-                self.rosbag_topic_publishers[topic["name"]] = publisher
-                self.get_logger().info(f"Created publisher for {topic['name']} [{topic['type']}]")
-
-            except Exception as e:
-                self.get_logger().error(f"Failed to create publisher for {topic['name']}: {str(e)}")
-        
-        return
-
-    def play(self):
-        first_msg_time = None
-        base_time = time()
-
-        while self.reader.has_next():
-            if self.svo1_started is False or self.svo2_started is False:
-                continue
-
-            error = max(self.rosbag_current_timestamp - self.svo2_current_timestamp, self.rosbag_current_timestamp - self.svo1_current_timestamp)
-            if error > 3:
-                self.rosbag_paused = True
-            else:
-                if self.rosbag_paused:
-                    self.reset_time = True
-                    self.rosbag_paused = False
-
-            if self.rosbag_paused:
-                continue 
-
-            topic, data, t = self.reader.read_next()
-            # Time control
-            if first_msg_time is None or self.reset_time is True:
-                print("reset time")
-                first_msg_time = t
-                base_time = time()
-                self.reset_time = False
-            else:
-                elapsed_ros_time = (t - first_msg_time) / 1e9
-                self.get_logger().debug(f'elapsed ros time: {elapsed_ros_time}')
-                target_wall_time = base_time + elapsed_ros_time / self.rosbag_rate
-                self.get_logger().debug(f'target_wall time: {target_wall_time}')
-                self.get_logger().debug(f'curent time: {time()}')
-                sleep(max(0, target_wall_time - time()))
-            #Publish data
-            if topic in self.topic_types:
-                try:
-                    msg_type = self.topic_types[topic]
-                    msg_class = get_message(msg_type)
-                    msg = deserialize_message(data, msg_class)
-                    if hasattr(msg, 'header') and hasattr(msg.header, 'stamp'):
-                      stamp = msg.header.stamp
-                      self.rosbag_current_timestamp = stamp.sec + stamp.nanosec * 1e-9
-                    if topic in self.rosbag_topic_publishers:
-                        self.rosbag_topic_publishers[topic].publish(msg)
-
-                except Exception as e:
-                    self.get_logger().error(f'Error deserializing message for {topic}: {str(e)}')
-            if not self.rosbag_started:
-                self.rosbag_started = True
-
-        if not self.reader.has_next():
-            self.get_logger().info("Rosbag replay complete. Shutting down node.")
-            return
-
-    
-def main(args=None):
-    rclpy.init(args=args)
-    
+def main():
+    rclpy.init()
+    node = DataSynchronizer()
     try:
-        sync_node = DataSynchronizer()
-        rclpy.spin(sync_node)
+        rclpy.spin(node)
     except KeyboardInterrupt:
-        if sync_node is not None:
-            sync_node.get_logger().info("Shutting down due to KeyboardInterrupt...")
-    finally:
-        # Make sure the node is destroyed only if context is still valid
-        if rclpy.ok():
-            sync_node.get_logger().info("Shutting down cleanly...")
-            sync_node.destroy_node()
-            rclpy.shutdown()
-
+        pass
+    node.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

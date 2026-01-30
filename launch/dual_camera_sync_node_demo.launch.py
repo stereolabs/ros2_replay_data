@@ -75,7 +75,7 @@ def launch_setup(context, *args, **kwargs):
     svo2_path = LaunchConfiguration('svo2_path')
     bag_path = LaunchConfiguration('bag_path')
     yaml_path = LaunchConfiguration('yaml_config_path')
-    sync_queue_size = LaunchConfiguration('sync_queue_size')
+    sync_buffer_time = LaunchConfiguration('sync_buffer_time')
     sync_slop = LaunchConfiguration('sync_slop')
     seek_time_step = LaunchConfiguration('seek_time_step')
     prefix = LaunchConfiguration('prefix')
@@ -218,7 +218,7 @@ def launch_setup(context, *args, **kwargs):
                 {'namespace': namespace_val},
                 {'camera_name_1': camera1_name_val},
                 {'camera_name_2': camera2_name_val},
-                {'sync_queue_size': sync_queue_size},
+                {'sync_buffer_time': sync_buffer_time},
                 {'sync_slop': sync_slop},
                 {'seek_time_step': seek_time_step},
                 {'prefix': prefix_val}
@@ -280,13 +280,13 @@ def generate_launch_description():
                 default_value=TextSubstitution(text=''),
                 description='String prefix to remove to wrapper topics'),
             DeclareLaunchArgument(
-                'sync_queue_size',
-                default_value='500',
-                description='Sync message filter queue size'),
+                'sync_buffer_time',
+                default_value='2.0',
+                description='Sync message buffer time: how much data time (in seconds) is stored in topic buffers before being erased'),
             DeclareLaunchArgument(
                 'sync_slop',
-                default_value='0.05',
-                description='Sync message filter slop'),
+                default_value='0.15',
+                description='Sync message filter slop, maximum time allowed between topic timestamps to validate a synchronization'),
             DeclareLaunchArgument(
                 'seek_time_step',
                 default_value='0.2',
