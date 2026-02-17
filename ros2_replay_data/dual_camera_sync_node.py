@@ -43,6 +43,7 @@ class DataSynchronizer(Node):
         
         self.sync_slop = self.declare_parameter("sync_slop", 0.05).value # 50ms window
         self.sync_buffer_time = self.declare_parameter("sync_buffer_time", 2.0).value # 2.0s buffer window
+        self.sync_publish_rate_hz = self.declare_parameter("sync_publish_rate_hz",10.0).value
 
         # --- Data Structures ---
         # topic_name -> [(timestamp, message_object), ...]
@@ -82,6 +83,23 @@ class DataSynchronizer(Node):
         # --- Background Threads ---
         threading.Thread(target=self.playback_loop, daemon=True).start()
         threading.Thread(target=self.keyboard_controller, daemon=True).start()
+        threading.Thread(target=self.sync_publish_loop, daemon=True).start()
+
+    def sync_publish_loop(self):
+        """Run sync+publish at a fixed rate independent of rosbag message cadence."""
+        if self.sync_publish_rate_hz <= 0.0:
+            self.get_logger().warn("sync_publish_rate_hz <= 0.0, sync publish loop disabled.")
+            return
+
+        period_sec = 1.0 / self.sync_publish_rate_hz
+        
+        while rclpy.ok():
+            if self.is_paused or self.rosbag_ts <= 0.0:
+                sleep(0.02)
+                continue
+            self.sync_and_publish_all(self.rosbag_ts)
+            sleep(period_sec)
+
 
     def get_qos_profiles_from_bag(self,bag_path, topic_name):
         metadata_file = os.path.join(bag_path, 'metadata.yaml')
@@ -260,7 +278,7 @@ class DataSynchronizer(Node):
 
             # 6. Synchronize and Publish SVO Topics
             # This looks into the buffers for messages closest to 'self.rosbag_ts'
-            self.sync_and_publish_all(self.rosbag_ts)
+            #self.sync_and_publish_all(self.rosbag_ts)
 
     def sync_and_publish_all(self, target_ts):
         """Searches all SVO buffers for the closest match to the current Bag time."""
@@ -271,9 +289,7 @@ class DataSynchronizer(Node):
                 # Find index of closest timestamp
                 best_idx = min(range(len(buffer)), key=lambda i: abs(buffer[i][0] - target_ts))
                 diff = abs(buffer[best_idx][0] - target_ts)
-                
-                self.get_logger().debug(f"topic name: {topic_name}")
-                self.get_logger().debug(f"diff: {diff}")
+            
                 if diff <= self.sync_slop:
                     msg_to_pub = buffer[best_idx][1]
                     self.sync_publishers[topic_name].publish(msg_to_pub)

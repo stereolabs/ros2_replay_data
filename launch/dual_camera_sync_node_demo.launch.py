@@ -78,6 +78,7 @@ def launch_setup(context, *args, **kwargs):
     sync_buffer_time = LaunchConfiguration('sync_buffer_time')
     sync_slop = LaunchConfiguration('sync_slop')
     seek_time_step = LaunchConfiguration('seek_time_step')
+    sync_publish_rate_hz = LaunchConfiguration('sync_publish_rate_hz')
     prefix = LaunchConfiguration('prefix')
 
     namespace_val = namespace.perform(context)
@@ -221,6 +222,7 @@ def launch_setup(context, *args, **kwargs):
                 {'sync_buffer_time': sync_buffer_time},
                 {'sync_slop': sync_slop},
                 {'seek_time_step': seek_time_step},
+                {'sync_publish_rate_hz': sync_publish_rate_hz},
                 {'prefix': prefix_val}
             ],
         )
@@ -287,6 +289,10 @@ def generate_launch_description():
                 'sync_slop',
                 default_value='0.15',
                 description='Sync message filter slop, maximum time allowed between topic timestamps to validate a synchronization'),
+             DeclareLaunchArgument(
+                'sync_publish_rate_hz',
+                default_value='10.0',
+                description='ROS2 wrapper Synchronizes topics publish rate'),
             DeclareLaunchArgument(
                 'seek_time_step',
                 default_value='0.2',
